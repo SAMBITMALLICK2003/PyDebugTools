@@ -1,5 +1,6 @@
 import sys
 import traceback
+import re
 from langchain_groq import ChatGroq
 from IPython.core.interactiveshell import InteractiveShell
 from rich.console import Console
@@ -7,8 +8,9 @@ from rich.panel import Panel
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from rich.syntax import Syntax
-import inspect
 import os
+import argparse
+
 
 class PyDebugger:
     def __init__(self, langchain_model=None, api_key=None):
@@ -18,6 +20,7 @@ class PyDebugger:
         self.original_excepthook = sys.excepthook
         self.console = Console()
         self.environment = "notebook" if self.is_notebook() else "script"
+        self.error_history = []
 
     def is_notebook(self):
         try:
@@ -78,18 +81,113 @@ class PyDebugger:
         if self.original_showtraceback:
             self.original_showtraceback(*args, **kwargs)
         self.process_error(exc_type, exc_value, exc_traceback)
+        self.console.print(
+            Panel(
+                "[bold green]You can ask a question about this error using `ask_question('Your question')`.[/bold green]",
+                title="[bold blue]💡 Tip[/bold blue]",
+                border_style="blue",
+                expand=True
+            )
+        )
 
     def handle_script_error(self, exc_type, exc_value, exc_traceback):
         traceback.print_exception(exc_type, exc_value, exc_traceback)
         self.process_error(exc_type, exc_value, exc_traceback)
 
+    def split_explanation_and_code(self, response):
+        """
+        Split the response into explanation and corrected code.
+        """
+        code_match = re.search(r"```\n(.*?)```", response, re.DOTALL)
+        if not code_match:
+            code_match = re.search(r"```Python\n(.*?)```", response, re.DOTALL)
+        if code_match:
+            explanation = response[:code_match.start()].strip()
+            corrected_code = code_match.group(1).strip()
+            return explanation, corrected_code
+        return response.strip(), None
+
+    def ask_question(self, question):
+        if not self.error_history:
+            self.console.print(
+                Panel(
+                    "[bold yellow]No error history found! Please run a code snippet with errors first.[/bold yellow]",
+                    title="[bold red]⚠️ Error History Empty[/bold red]",
+                    border_style="red"
+                )
+            )
+            return
+
+        # Retrieve the last error details
+        last_error = self.error_history[-1]
+
+        system_template = """
+        Answer the user's question based on the following Python error details and traceback. If relevant, include suggestions. Try to correct the traceback based on the code input provided if provided at all.
+
+        Error Details:
+        - Code Error: {code_error}
+        - Line Number: {line_number}
+        - File Name: {file_name}
+
+        User Question: {user_question}
+        """
+        prompt_template = ChatPromptTemplate.from_messages(
+            [("system", system_template), ("user", "{user_question}")]
+        )
+        output_parser = StrOutputParser()
+        chain = prompt_template | self.langchain_model | output_parser
+
+        try:
+            response = chain.invoke({
+                "code_error": last_error["code_error"],
+                "line_number": last_error["line_number"],
+                "file_name": last_error["file_name"],
+                "user_question": question
+            })
+
+            explanation, corrected_code = self.split_explanation_and_code(response)
+            # Print the explanation in the response panel
+            explanation_panel = Panel(
+                explanation.strip(),
+                title="[bold cyan]🤖 Explanation[/bold cyan]",
+                border_style="cyan",
+                expand=True
+            )
+            self.console.print(explanation_panel)
+
+            # Print the corrected code in a separate panel, if available
+            if corrected_code:
+                syntax = Syntax(corrected_code.strip(), "python", theme="monokai")
+                code_panel = Panel(
+                    syntax,
+                    title="[bold green]✅ Corrected Code[/bold green]",
+                    border_style="green",
+                    expand=True
+                )
+                self.console.print(code_panel)
+
+        except Exception as langchain_error:
+            # Handle LangChain errors gracefully
+            error_handling_panel = Panel(
+                f"[bold white]{str(langchain_error)}[/bold white]",
+                title="[bold yellow]⚠️ PyDebugger Question Error[/bold yellow]",
+                border_style="yellow",
+                expand=True
+            )
+            self.console.print(error_handling_panel)
 
     def process_error(self, exc_type, exc_value, exc_traceback):
         error_details = self.extract_error_details(exc_type, exc_value, exc_traceback)
+        self.error_history.append(error_details)
 
-        # Get file content if it's a .py file
         file_content = self.get_file_content(error_details.get("file_name"))
-        # Generate explanation and solution using LangChain
+        code_snippet = None
+        if file_content and error_details["line_number"]:
+            lines = file_content.splitlines()
+            start = max(0, error_details["line_number"] - 3)
+            end = min(len(lines), error_details["line_number"] + 2)
+            code_snippet = "\n".join(lines[start:end])
+
         system_template = """
         Analyze the following Python code error. Identify the cause and suggest a possible correction for the error part only. Answer in short and do not over-explain.
 
@@ -107,16 +205,31 @@ class PyDebugger:
         try:
             response = chain.invoke(error_details)
 
-            # Display the explanation and solution in a professional format
-            solution_panel = Panel(
-                f"[bold white]{response}[/bold white]",
-                title="[bold cyan]🤖 PyDebugger[/bold cyan]",
+            # Extract corrected code if available
+            explanation, corrected_code = self.split_explanation_and_code(response)
+
+            # Print the explanation in the response panel
+            explanation_panel = Panel(
+                explanation.strip(),
+                title="[bold cyan]🤖 Explanation[/bold cyan]",
                 border_style="cyan",
                 expand=True
             )
-            self.console.print(solution_panel)
+            self.console.print(explanation_panel)
+
+            # Print the corrected code in a separate panel, if available
+            if corrected_code:
+                syntax = Syntax(corrected_code.strip(), "python", theme="monokai")
+                code_panel = Panel(
+                    syntax,
+                    title="[bold green]✅ Corrected Code[/bold green]",
+                    border_style="green",
+                    expand=True
+                )
+                self.console.print(code_panel)
+
+
         except Exception as langchain_error:
-            # Handle any issues with LangChain itself
             error_handling_panel = Panel(
                 f"[bold white]{str(langchain_error)}[/bold white]",
                 title="[bold yellow]⚠️ PyDebugger Error[/bold yellow]",
